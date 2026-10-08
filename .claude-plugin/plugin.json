@@ -1,10 +1,33 @@
 {
   "name": "subagent-audit",
-  "version": "0.2.2",
-  "description": "Writes an on-disk audit record of every native subagent run: prompt, model, tool calls, files changed, result, usage.",
-  "author": { "name": "lphilbrooks" },
+  "version": "0.3.0",
+  "description": "Transparency for native subagents: audit records, git-based file attribution, scope checks, chat receipts and a /subagents pane.",
+  "author": {
+    "name": "lphilbrooks"
+  },
   "homepage": "https://github.com/lphilbrooks/subagent-audit",
   "repository": "https://github.com/lphilbrooks/subagent-audit",
   "license": "MIT",
-  "keywords": ["subagents", "audit", "logging", "transparency", "observability"]
+  "keywords": [
+    "subagents",
+    "audit",
+    "logging",
+    "transparency",
+    "observability"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "receipts": {
+      "type": "boolean",
+      "title": "Chat receipts",
+      "description": "Write a short audit notice into the chat when a subagent finishes. The model never reads it.",
+      "default": true
+    },
+    "gitAttribution": {
+      "type": "boolean",
+      "title": "Git file attribution",
+      "description": "Compare git status when a subagent starts and ends to see which files it changed. Runs git locally; waits up to 1.5 s before a subagent starts.",
+      "default": true
+    }
+  }
 }

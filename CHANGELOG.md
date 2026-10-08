@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-10-09
+- Git-based file attribution: `git status` plus content hashes before and after each subagent, so edits made through Bash are caught; overlapping or background runs are marked shared.
+- Scope checks for read-only agent types (`Explore`, `Plan`, `claude-code-guide`).
+- A receipt notice in the chat when a subagent finishes (never read by the model).
+- `/subagents` pane: this session's subagents with scope, git changes, flagged calls, tool timeline, task and result.
+- Options `receipts` and `gitAttribution`.
+- Runs record the session id; the code is split into small modules with their own tests.
+
 ## 0.2.2 - 2026-10-08
 - Hooks now return `next()`'s result untouched and do all recording afterwards, off the engine's path. A recording failure can no longer block or delay a spawn or tool call.
 - Tool arguments and outputs are clipped before redaction, so a large `Write` is never scanned whole.

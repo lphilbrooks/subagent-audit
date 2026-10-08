@@ -1,21 +1,42 @@
+import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
+
+import { buildFiles, diffSnapshots, parseStatus } from './gitdelta'
+import type { Snapshot } from './gitdelta'
+import { receiptText } from './receipt'
+import { clip, redact, scrub, text } from './redact'
+import { evaluateScope } from './scope'
+import type { Api, Run, ToolEntry } from './types'
+import { buildPane, listText } from './view'
 
 // One folder per subagent run under ~/.claude/agent-runs/ (or $CLAUDE_CONFIG_DIR/agent-runs):
 //   run.json  full machine-readable record
 //   prompt.md the task the subagent was given
 //   result.md the subagent's latest final report
-// Local files only. No model calls, no network. Secrets are pattern-redacted
-// before anything is stored; that is best effort, not a guarantee.
+// On top of that record the mod:
+//   - compares git state at the subagent's start and end, to attribute file changes
+//     (including edits made through Bash) and to flag violations by read-only agents;
+//   - writes a one-notice receipt into the chat when a subagent finishes (the model never
+//     reads it, so it costs no usage);
+//   - offers /subagents, a pane listing this session's subagents with their full audit detail.
+// Local only: no model calls, no network (git runs on this machine). Secrets are
+// pattern-redacted before anything is stored; that is best effort, not a guarantee.
 //
-// The hooks only observe: each returns exactly what `next()` returned, and all
-// recording happens after that, off the engine's path, inside try/catch.
+// The hooks only observe: each returns exactly what `next()` returned, and recording
+// happens after that, off the engine's path, inside try/catch. The one exception is the
+// git snapshot taken before a subagent starts, which waits at most SNAP_BUDGET_MS.
 
+const PANE = 'subagent-audit'
 const FLUSH_MS = 2000
 const END_WAIT_MS = 2000
+const SNAP_BUDGET_MS = 1500
+const SNAP_TIMEOUT_MS = 4000
+const MAX_SNAP_FILES = 300
+const MAX_GIT_FILES = 200
+const MAX_DISK_SCAN = 80
 const MAX_FIELD = 2000
 const MAX_INPUT = 600
 const MAX_PREVIEW = 300
-const MAX_SCAN = 20000
 const MAX_TOOLS = 1000
 const MAX_FILES = 500
 const MAX_LIVE_RUNS = 200
@@ -25,61 +46,11 @@ const SLOW_AFTER_TOOLS = 200
 const SLOW_FLUSH_MS = 10000
 const CHANGERS = new Set(['Edit', 'Write', 'NotebookEdit'])
 
-type Timer = { cancel: () => void }
-
-type Fs = {
-  clock: {
-    now: () => number | Promise<number>
-    every: (ms: number, fn: () => void) => Timer
-    sleep: (ms: number) => Promise<void>
-  }
-  env: { get: (name: string) => Promise<string | undefined> }
-  fs: {
-    write: (path: string, text: string) => Promise<void>
-    read: (path: string) => Promise<string>
-    list: (path: string) => Promise<{ name: string }[]>
-  }
-}
-
-type ToolEntry = {
-  at: string
-  tool: string
-  ms: number
-  outcome: 'ok' | 'error' | 'denied'
-  input: string
-  preview?: string
-}
-
-type Turn = {
-  endedAt: string
-  reason: string
-  durationMs: number
-  usage?: unknown
-  refusal?: string
-  answer?: string
-}
-
-type Run = {
-  agentId: string
-  folder: string
-  status: 'running' | 'completed' | 'aborted' | 'error' | 'refused' | 'denied' | 'unfinished'
-  startedAt: string
-  endedAt?: string
-  resumedAt?: string
-  spawn: Record<string, unknown>
-  tools: ToolEntry[]
-  toolsDropped: number
-  // Files changed through Edit, Write and NotebookEdit calls that succeeded.
-  filesChanged: string[]
-  // Bash and MCP calls that succeeded and that the engine did not mark read-only.
-  // Not a complete list of side effects, but the calls worth a second look.
-  possibleMutations: { tool: string; input: string }[]
-  turns: Turn[]
-  answer?: string
-  note?: string
-}
-
 type ToolOutcome = { deny?: string; isError?: boolean; text?: string; isReadOnly?: boolean }
+type Started = { deny?: string; model?: string; agentId?: string; teammateId?: string }
+
+const selectedAtom = atom({ plugin: 'subagent-audit', key: 'selected' } as const, '')
+const flaggedAtom = atom({ plugin: 'subagent-audit', key: 'onlyFlagged' } as const, false)
 
 // Module state. A hot reload clears it; runFor rehydrates a run from disk.
 const runs = new Map<string, Run>()
@@ -89,25 +60,14 @@ const promptWritten = new Set<string>()
 const resultWritten = new Map<string, string>()
 const chains = new Map<string, Promise<void>>()
 const lastFlush = new Map<string, number>()
+const snapshots = new Map<string, Snapshot>()
+const pendingSnapshots = new Map<string, Snapshot>()
 let base: string | undefined
+let sessionId: string | undefined
 let timerArmed = false
+let diskLoaded = false
 let counter = 0
-
-const SECRET_PATTERNS: [RegExp, string][] = [
-  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]{0,8000}?-----END [A-Z ]*PRIVATE KEY-----/g, '[redacted private key]'],
-  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, '[redacted jwt]'],
-  [/\b(?:sk-ant-|sk-|sk_live_|sk_test_|rk_live_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xox[abprs]-|AKIA|ASIA|AIza|hf_|npm_|SG\.|ya29\.)[A-Za-z0-9_.-]{12,}/g, '[redacted token]'],
-  [/\b(Authorization(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?(?:Bearer|Basic|Token)\s+)[^\s"'\\]{6,}/gi, '$1[redacted]'],
-  [/\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/gi, 'Bearer [redacted]'],
-  [/\b([a-z][a-z0-9+.-]{1,20}:\/\/[^\s:@/]+:)[^\s@/]+@/gi, '$1[redacted]@'],
-  [/((?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|credential|private[_-]?key|access[_-]?key)[A-Za-z0-9_]*(?:\\?["'])?\s*[=:]\s*(?:\\?["'])?)(?=[^\s"'\\&,;]*[A-Za-z])[^\s"'\\&,;]{6,}/gi, '$1[redacted]'],
-]
-
-function redact(text: string): string {
-  let out = text
-  for (const [pattern, replacement] of SECRET_PATTERNS) out = out.replace(pattern, replacement)
-  return out
-}
+let config = { receipts: true, gitAttribution: true }
 
 const pad = (n: number) => String(n).padStart(2, '0')
 
@@ -116,13 +76,6 @@ const stamp = (d: Date) =>
 
 const slug = (s: string) =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'task'
-
-const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}… [+${s.length - n} chars]` : s)
-
-// Clip first, then redact: a huge tool argument is never scanned whole.
-const scrub = (s: string, n: number) => clip(redact(s.slice(0, MAX_SCAN)), n)
-
-const text = (v: unknown): string => (typeof v === 'string' ? v : v === undefined || v === null ? '' : String(v))
 
 const idTail = (agentId: string) => slug(agentId).slice(-12)
 
@@ -134,7 +87,7 @@ function normPath(p: string, cwd: unknown): string {
   return !isAbsolute && typeof cwd === 'string' && cwd !== '' ? `${toSlash(cwd).replace(/\/$/, '')}/${slashed}` : slashed
 }
 
-async function clockNow($: Fs): Promise<number> {
+async function clockNow($: Api): Promise<number> {
   try {
     return await $.clock.now()
   } catch {
@@ -142,11 +95,22 @@ async function clockNow($: Fs): Promise<number> {
   }
 }
 
-async function baseDir($: Fs): Promise<string | undefined> {
+async function sessionIdOf($: Api): Promise<string | undefined> {
+  if (sessionId === undefined) {
+    try {
+      sessionId = await $.session.id()
+    } catch {
+      return undefined
+    }
+  }
+  return sessionId
+}
+
+async function baseDir($: Api): Promise<string | undefined> {
   if (base !== undefined) return base
-  const config = await $.env.get('CLAUDE_CONFIG_DIR')
-  if (config) {
-    base = `${toSlash(config).replace(/\/$/, '')}/agent-runs`
+  const configDir = await $.env.get('CLAUDE_CONFIG_DIR')
+  if (configDir) {
+    base = `${toSlash(configDir).replace(/\/$/, '')}/agent-runs`
     return base
   }
   const home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME'))
@@ -155,10 +119,69 @@ async function baseDir($: Fs): Promise<string | undefined> {
   return base
 }
 
+function redraw($: Api): void {
+  try {
+    $.ui.invalidate('ui.render')
+  } catch {
+    // nothing is drawing
+  }
+}
+
+// ---- git attribution -------------------------------------------------------
+
+async function takeSnapshot($: Api, cwd: string | undefined): Promise<Snapshot | undefined> {
+  try {
+    const init = { cwd, timeoutMs: SNAP_TIMEOUT_MS }
+    const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'], init)
+    if (top.exitCode !== 0) return undefined
+    const root = top.stdout.trim()
+    const status = await $.process.run(['git', '-c', 'core.quotepath=off', 'status', '--porcelain=v1', '-uall'], {
+      cwd: root,
+      timeoutMs: SNAP_TIMEOUT_MS,
+    })
+    if (status.exitCode !== 0) return undefined
+    const entries = parseStatus(status.stdout)
+    const hashable = entries.filter(e => !e.xy.includes('D')).slice(0, MAX_SNAP_FILES)
+    let hashed: string[] = []
+    if (hashable.length > 0) {
+      const res = await $.process.run(['git', 'hash-object', '--stdin-paths'], {
+        cwd: root,
+        stdin: `${hashable.map(e => e.path).join('\n')}\n`,
+        timeoutMs: SNAP_TIMEOUT_MS,
+      })
+      if (res.exitCode === 0) hashed = res.stdout.split('\n')
+    }
+    return {
+      root,
+      files: buildFiles(entries, hashable, hashed),
+      truncated: entries.length > MAX_SNAP_FILES,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+async function snapshotWithin($: Api, cwd: string | undefined): Promise<Snapshot | undefined> {
+  if (!config.gitAttribution) return undefined
+  try {
+    return await Promise.race([takeSnapshot($, cwd), $.clock.sleep(SNAP_BUDGET_MS).then(() => undefined)])
+  } catch {
+    return undefined
+  }
+}
+
+function overlaps(a: Run, b: Run, now: number): boolean {
+  const aStart = a.startMs ?? 0
+  const bStart = b.startMs ?? 0
+  return aStart < (b.endMs ?? now) && bStart < (a.endMs ?? now)
+}
+
+// ---- persistence -----------------------------------------------------------
+
 // Writes for one run are chained so an older snapshot can never land after a
 // newer one; the snapshot is serialised when its turn comes, so it is the latest.
 // A failed write puts the run back in `dirty` so the timer retries it.
-function flush($: Fs, run: Run): Promise<void> {
+function flush($: Api, run: Run): Promise<void> {
   dirty.delete(run.agentId)
   const prev = chains.get(run.folder) ?? Promise.resolve()
   const next = prev
@@ -184,7 +207,7 @@ function flush($: Fs, run: Run): Promise<void> {
   return next
 }
 
-async function flushDirty($: Fs): Promise<void> {
+async function flushDirty($: Api): Promise<void> {
   for (const id of [...dirty]) {
     const run = runs.get(id)
     if (!run) {
@@ -195,11 +218,12 @@ async function flushDirty($: Fs): Promise<void> {
     if (isSlow && (await clockNow($)) - (lastFlush.get(id) ?? 0) < SLOW_FLUSH_MS) continue
     await flush($, run)
   }
+  redraw($)
 }
 
 // One timer for the module. session.start arms it; so does the first tool call,
 // for a module reloaded without a session.start.
-function armTimer($: Fs): void {
+function armTimer($: Api): void {
   if (timerArmed) return
   timerArmed = true
   $.clock.every(FLUSH_MS, () => { void flushDirty($) })
@@ -207,6 +231,7 @@ function armTimer($: Fs): void {
 
 function forget(run: Run): void {
   runs.delete(run.agentId)
+  snapshots.delete(run.agentId)
   promptWritten.delete(run.folder)
   resultWritten.delete(run.folder)
   chains.delete(run.folder)
@@ -228,8 +253,10 @@ function open(agentId: string, spawn: Record<string, unknown>, status: Run['stat
   const run: Run = {
     agentId,
     folder,
+    session: sessionId,
     status,
     startedAt: now.toISOString(),
+    startMs: now.getTime(),
     spawn,
     tools: [],
     toolsDropped: 0,
@@ -242,10 +269,28 @@ function open(agentId: string, spawn: Record<string, unknown>, status: Run['stat
   return run
 }
 
+function parseRun(raw: string, name: string): Run | undefined {
+  try {
+    const run = JSON.parse(raw) as Run
+    if (typeof run.agentId !== 'string') return undefined
+    run.folder = name
+    return run
+  } catch {
+    return undefined
+  }
+}
+
+function adopt(run: Run): void {
+  usedFolders.add(run.folder)
+  promptWritten.add(run.folder)
+  if (run.answer !== undefined) resultWritten.set(run.folder, run.answer)
+  runs.set(run.agentId, run)
+}
+
 // After a reload the module has forgotten its runs: find the run's folder on
 // disk by the agent id in its name and carry on writing to it. The folder name
 // on disk is trusted over the one inside run.json; a truncated run.json is skipped.
-async function rehydrate($: Fs, agentId: string): Promise<Run | undefined> {
+async function rehydrate($: Api, agentId: string): Promise<Run | undefined> {
   const root = await baseDir($)
   if (root === undefined) return undefined
   const entries = await $.fs.list(root).catch(() => [])
@@ -253,37 +298,57 @@ async function rehydrate($: Fs, agentId: string): Promise<Run | undefined> {
   const names = entries.map(x => x.name).filter(n => n.includes(suffix)).sort().reverse()
   for (const name of names) {
     const raw = await $.fs.read(`${root}/${name}/run.json`).catch(() => undefined)
-    if (raw === undefined) continue
-    try {
-      const run = JSON.parse(raw) as Run
-      if (run.agentId !== agentId) continue
-      run.folder = name
-      usedFolders.add(name)
-      promptWritten.add(name)
-      if (run.answer !== undefined) resultWritten.set(name, run.answer)
-      return run
-    } catch {
-      continue
-    }
+    const run = raw === undefined ? undefined : parseRun(raw, name)
+    if (run && run.agentId === agentId) return run
   }
   return undefined
 }
 
 // A subagent's events can arrive before its spawn is recorded, or after a
 // reload cleared module state: rehydrate from disk, else a labelled stub run.
-async function runFor($: Fs, agentId: string): Promise<Run> {
+async function runFor($: Api, agentId: string): Promise<Run> {
   const known = runs.get(agentId)
   if (known) return known
   const loaded = await rehydrate($, agentId)
   const raced = runs.get(agentId)
   if (raced) return raced
   if (loaded) {
-    runs.set(agentId, loaded)
+    adopt(loaded)
     return loaded
   }
   return open(agentId, { subagentType: 'unknown', description: 'seen-without-spawn' }, 'running',
     'Events seen without a recorded spawn (the spawn hook was skipped, or the folder was removed).')
 }
+
+// The pane lists this session's subagents. After a reload or a resume the module
+// has none in memory, so the first look reads this session's recent runs from disk.
+async function loadSessionRuns($: Api): Promise<void> {
+  if (diskLoaded) return
+  diskLoaded = true
+  try {
+    const root = await baseDir($)
+    const sid = await sessionIdOf($)
+    if (root === undefined || sid === undefined) return
+    const entries = await $.fs.list(root).catch(() => [])
+    const names = entries.map(x => x.name).sort().reverse().slice(0, MAX_DISK_SCAN)
+    for (const name of names) {
+      if (usedFolders.has(name)) continue
+      const raw = await $.fs.read(`${root}/${name}/run.json`).catch(() => undefined)
+      const run = raw === undefined ? undefined : parseRun(raw, name)
+      if (run && run.session === sid && !runs.has(run.agentId)) adopt(run)
+    }
+  } catch {
+    // listing is a convenience
+  }
+}
+
+function sessionRuns(): Run[] {
+  return [...runs.values()]
+    .filter(r => r.session === undefined || r.session === sessionId)
+    .sort((a, b) => b.startedAt.localeCompare(a.startedAt))
+}
+
+// ---- recording -------------------------------------------------------------
 
 function spawnRecord(e: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -305,10 +370,15 @@ function spawnRecord(e: Record<string, unknown>): Record<string, unknown> {
   }
 }
 
-type Started = { deny?: string; model?: string; agentId?: string; teammateId?: string }
-
-function recordSpawn($: Fs, e: Record<string, unknown>, started: Started | undefined, error?: unknown): void {
+async function recordSpawn(
+  $: Api,
+  e: Record<string, unknown>,
+  started: Started | undefined,
+  error: unknown,
+  before: Snapshot | undefined,
+): Promise<void> {
   try {
+    await sessionIdOf($)
     let spawn: Record<string, unknown>
     try {
       spawn = spawnRecord(e)
@@ -319,30 +389,35 @@ function recordSpawn($: Fs, e: Record<string, unknown>, started: Started | undef
     if (error !== undefined) {
       const run = open(`failed-${++counter}-${toolUse}`, spawn, 'error', scrub(`spawn failed: ${text(error)}`, MAX_INPUT))
       run.endedAt = run.startedAt
+      run.endMs = run.startMs
       void flush($, run)
     } else if (started?.deny !== undefined) {
       const run = open(`denied-${++counter}-${toolUse}`, spawn, 'denied', scrub(started.deny, MAX_INPUT))
       run.endedAt = run.startedAt
+      run.endMs = run.startMs
       void flush($, run)
     } else if (started?.agentId !== undefined) {
       const full = { ...spawn, resolvedModel: started.model, teammateId: started.teammateId }
+      if (before) snapshots.set(started.agentId, before)
       const existing = runs.get(started.agentId)
       if (existing) {
         // Tool events beat the spawn record here: keep what they collected.
         existing.spawn = full
+        existing.session = existing.session ?? sessionId
         existing.note = undefined
         void flush($, existing)
       } else {
         void flush($, open(started.agentId, full, 'running'))
       }
     }
+    redraw($)
   } catch {
     // logging must never get in the way of a spawn
   }
 }
 
 async function recordTool(
-  $: Fs,
+  $: Api,
   agentId: string,
   e: Record<string, unknown>,
   result: ToolOutcome,
@@ -365,6 +440,7 @@ async function recordTool(
       run.status = 'running'
       run.resumedAt = new Date(endedAt).toISOString()
       run.endedAt = undefined
+      run.endMs = undefined
     }
     if (run.tools.length < MAX_TOOLS) {
       run.tools.push({
@@ -397,12 +473,45 @@ async function recordTool(
   }
 }
 
-async function recordTurn($: Fs, e: Record<string, unknown>): Promise<void> {
+// Runs when a subagent's turn ends: attribute file changes with a second git
+// snapshot, judge scope, save, write the receipt, redraw.
+async function finalize($: Api, run: Run): Promise<void> {
+  try {
+    const before = snapshots.get(run.agentId)
+    if (before) {
+      const after = await snapshotWithin($, before.root)
+      if (after) {
+        const now = Date.now()
+        const others = [...runs.values()].filter(r => r !== run && overlaps(r, run, now))
+        const shared = run.spawn.background === true || others.length > 0
+        const changes = diffSnapshots(before, after)
+        run.gitDelta = {
+          files: changes.slice(0, MAX_GIT_FILES),
+          attribution: shared ? 'shared' : 'exclusive',
+          truncated: before.truncated || after.truncated || changes.length > MAX_GIT_FILES || undefined,
+        }
+      }
+    }
+    run.scope = evaluateScope(run)
+    await flush($, run)
+    redraw($)
+    if (config.receipts) {
+      await $.session
+        .append({ message: { type: 'system', content: [{ type: 'text', text: receiptText(run) }] } })
+        .catch(() => {})
+    }
+  } catch {
+    // see recordSpawn
+  }
+}
+
+async function recordTurn($: Api, e: Record<string, unknown>): Promise<void> {
   try {
     armTimer($)
     const agentId = text(e.agentId)
     const run = await runFor($, agentId)
-    const now = new Date().toISOString()
+    const nowMs = Date.now()
+    const now = new Date(nowMs).toISOString()
     const answer = redact(text(e.answer))
     run.turns.push({
       endedAt: now,
@@ -413,10 +522,11 @@ async function recordTurn($: Fs, e: Record<string, unknown>): Promise<void> {
       answer,
     })
     run.endedAt = now
+    run.endMs = nowMs
     run.answer = answer
     run.status =
       e.reason === 'answer' ? 'completed' : e.reason === 'aborted' ? 'aborted' : e.reason === 'refusal' ? 'refused' : 'error'
-    void flush($, run)
+    void finalize($, run)
   } catch {
     // see recordSpawn
   }
@@ -425,13 +535,15 @@ async function recordTurn($: Fs, e: Record<string, unknown>): Promise<void> {
 // Anything still running when the session ends (a remote workflow agent never
 // raises turn.complete, a crashed run never finishes) is marked unfinished.
 // Waits for the writes, but never longer than END_WAIT_MS.
-async function endSession($: Fs): Promise<void> {
+async function endSession($: Api): Promise<void> {
   try {
-    const now = new Date().toISOString()
+    const nowMs = Date.now()
     for (const run of runs.values()) {
       if (run.status === 'running') {
         run.status = 'unfinished'
-        run.endedAt = now
+        run.endedAt = new Date(nowMs).toISOString()
+        run.endMs = nowMs
+        run.scope = evaluateScope(run)
         dirty.add(run.agentId)
       }
     }
@@ -445,21 +557,44 @@ async function endSession($: Fs): Promise<void> {
   }
 }
 
-export const register: Register = on => {
+async function openPane($: Api): Promise<string> {
+  await sessionIdOf($)
+  await loadSessionRuns($)
+  try {
+    await $.ui.open({ id: PANE, title: 'Subagents', focus: true })
+  } catch {
+    // a surface that draws no pane gets the text reply alone
+  }
+  return listText(sessionRuns())
+}
+
+export const register: Register = (on, options) => {
+  config = {
+    receipts: options?.receipts !== false,
+    gitAttribution: options?.gitAttribution !== false,
+  }
+
   on('session.start', async ($, e, next) => {
     armTimer($)
+    await $.command.register({
+      name: 'subagents',
+      description: 'Browse this session\'s subagent runs: scope, git changes, tool calls, result',
+    })
     return next(e)
   })
 
+  on('command.run', { command: 'subagents' }, async $ => ({ text: await openPane($) }))
+
   on('agent.spawn', async ($, e, next) => {
+    const before = await snapshotWithin($, typeof e.cwd === 'string' ? e.cwd : undefined)
     let started
     try {
       started = await next(e)
     } catch (err) {
-      recordSpawn($, e as Record<string, unknown>, undefined, err)
+      void recordSpawn($, e as Record<string, unknown>, undefined, err, before)
       throw err
     }
-    recordSpawn($, e as Record<string, unknown>, started)
+    void recordSpawn($, e as Record<string, unknown>, started, undefined, before)
     return started
   })
 
@@ -481,5 +616,21 @@ export const register: Register = on => {
   on('session.end', async ($, e, next) => {
     await endSession($)
     return next(e)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const E = $.ui.resolve(e)
+    const selectedId = await read($, selectedAtom)
+    const onlyFlagged = await read($, flaggedAtom)
+    const list = sessionRuns()
+    return buildPane(E, {
+      runs: list,
+      selected: selectedId === '' ? undefined : list.find(r => r.agentId === selectedId),
+      onlyFlagged,
+      columns: e.props.bodyColumns ?? e.viewport?.columns ?? 80,
+      rows: e.viewport?.rows ?? 24,
+      select: id => { void update($, selectedAtom, () => id) },
+      toggleFlagged: () => { void update($, flaggedAtom, v => !v) },
+    })
   })
 }
