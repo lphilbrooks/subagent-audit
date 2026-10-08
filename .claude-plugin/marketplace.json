@@ -1,0 +1,12 @@
+{
+  "name": "subagent-audit",
+  "owner": { "name": "lphilbrooks" },
+  "description": "Marketplace for the subagent-audit Claude Code mod.",
+  "plugins": [
+    {
+      "name": "subagent-audit",
+      "source": "./",
+      "description": "On-disk audit record of every native Claude Code subagent run."
+    }
+  ]
+}

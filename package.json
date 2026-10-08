@@ -1,0 +1,10 @@
+{
+  "name": "subagent-audit",
+  "private": true,
+  "description": "Dev scripts for the subagent-audit Claude Code mod. The mod itself needs no npm install.",
+  "scripts": {
+    "validate": "claude plugin validate .",
+    "test": "claude plugin test .",
+    "typecheck": "npx -p typescript tsc -p . --noEmit"
+  }
+}

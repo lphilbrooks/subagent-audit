@@ -1,0 +1,10 @@
+{
+  "name": "subagent-audit",
+  "version": "0.2.2",
+  "description": "Writes an on-disk audit record of every native subagent run: prompt, model, tool calls, files changed, result, usage.",
+  "author": { "name": "lphilbrooks" },
+  "homepage": "https://github.com/lphilbrooks/subagent-audit",
+  "repository": "https://github.com/lphilbrooks/subagent-audit",
+  "license": "MIT",
+  "keywords": ["subagents", "audit", "logging", "transparency", "observability"]
+}
