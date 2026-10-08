@@ -10,6 +10,18 @@ A [Claude Code](https://code.claude.com) mod that adds transparency to native su
 
 No model calls and no network. Git runs locally.
 
+## What you see
+
+When a subagent finishes, a notice like this appears in the chat:
+
+```
+subagent-audit: Explore "find the parser" completed · 1m 58s · 5 tool calls · 2 files changed (git) · out 14k
+  changed: src/parser.ts, notes.md
+  scope: read-only agent, 2 violations: Write succeeded; git: src/parser.ts changed
+```
+
+Type `/subagents` to open the pane. It lists this session's subagents, newest first, with a status mark, duration, tool and file counts and a warning count. Select a row for its detail: scope verdict, files changed in git (and whether the attribution is exclusive or shared), files edited with the edit tools, flagged calls, the tool timeline, the task and the result, plus where its audit record and Claude Code's own transcript live. "Show flagged only" filters the list to runs with warnings. In a session that draws no pane (`claude -p`, the VS Code chat panel) the command answers with the same list as text.
+
 ## What gets recorded
 
 One folder per run in `~/.claude/agent-runs/` (or `$CLAUDE_CONFIG_DIR/agent-runs/` if that is set):
